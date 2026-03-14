@@ -207,4 +207,4 @@ sudo docker run --privileged -v $(pwd):/build -w /build opensuse/leap \
 
 ## License
 
-Same as the main project.
+GNU General Public License v3.0.
