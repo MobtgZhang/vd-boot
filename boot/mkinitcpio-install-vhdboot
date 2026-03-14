@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# mkinitcpio install hook - vhdboot (kloop/vloop)
+# Copy to chroot /usr/lib/initcpio/install/vhdboot
+
+build() {
+    add_binary kpartx
+    add_binary partx
+    add_binary blkid
+    add_binary mount.ntfs-3g
+    add_binary ntfs-3g
+    add_module fuse
+    add_module loop
+    add_module dm_mod
+    add_runscript
+}
+
+help() {
+    cat <<HELPEOF
+Adds support for booting from VHD file via kloop or vloop.
+Requires kernel params: kloop=/path/to.vhd kroot=/dev/mapper/loop0p1
+  or: vloop=/path/to.vhd vlooppart=p1
+HELPEOF
+}

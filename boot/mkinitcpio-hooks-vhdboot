@@ -1,0 +1,59 @@
+#!/usr/bin/ash
+# mkinitcpio runtime hook - vhdboot (kloop/vloop)
+# Copy to chroot /usr/lib/initcpio/hooks/vhdboot
+# Uses ash syntax
+
+run_hook() {
+    local x vloop kloop kroot vlooppart hostfstype hostdev disk_files
+
+    for x in $(cat /proc/cmdline); do
+        case $x in
+            kloop=*) kloop="${x#kloop=}" ;;
+            kroot=*) kroot="${x#kroot=}" ;;
+            vloop=*) vloop="${x#vloop=}" ;;
+            vlooppart=*) vlooppart="${x#vlooppart=}" ;;
+            hostfstype=*) hostfstype="${x#hostfstype=}" ;;
+        esac
+    done
+
+    if [ -n "$kloop" ]; then
+        export KLOOP_USED=1
+        hostdev="${root#block:}"
+        [ -n "$kroot" ] && root="$kroot" || root="/dev/loop0"
+        mkdir -p /host
+        [ -z "$hostfstype" ] && hostfstype="$(blkid -s TYPE -o value "$hostdev" 2>/dev/null)"
+        [ -z "$hostfstype" ] || [ "$hostfstype" = "ntfs" ] && hostfstype="ntfs-3g"
+        [ "$hostfstype" = "ntfs-3g" ] || modprobe "$hostfstype" 2>/dev/null
+        mount -t "$hostfstype" -o rw "$hostdev" /host
+        if [ "${kloop#/}" != "${kloop}" ]; then
+            modprobe loop
+            kpartx -av "/host$kloop"
+            [ -e "$root" ] || sleep 3
+        fi
+        return
+    fi
+
+    if [ -n "$vloop" ]; then
+        export VLOOP_USED=1
+        hostdev="${root#block:}"
+        [ -n "$vlooppart" ] && root="/dev/mapper/loop0${vlooppart}" || root="/dev/loop0"
+        mkdir -p /host
+        [ -z "$hostfstype" ] && hostfstype="$(blkid -s TYPE -o value "$hostdev" 2>/dev/null)"
+        [ -z "$hostfstype" ] || [ "$hostfstype" = "ntfs" ] && hostfstype="ntfs-3g"
+        [ "$hostfstype" = "ntfs-3g" ] || modprobe "$hostfstype" 2>/dev/null
+        mount -t "$hostfstype" -o rw "$hostdev" /host
+        if [ "${vloop#/}" != "${vloop}" ]; then
+            modprobe loop
+            kpartx -av "/host$vloop"
+            [ -e "$root" ] || sleep 3
+        fi
+        return
+    fi
+}
+
+run_latehook() {
+    if [ -n "$VLOOP_USED" ] || [ -n "$KLOOP_USED" ]; then
+        [ -d /new_root/host ] || mkdir -p /new_root/host
+        mount -M /host /new_root/host 2>/dev/null || true
+    fi
+}
