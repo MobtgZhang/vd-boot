@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mkinitcpio install hook - vhdboot (kloop/vloop)
+# mkinitcpio install hook - vhdboot (kloop/vloop/squashfs)
 # Copy to chroot /usr/lib/initcpio/install/vhdboot
 
 build() {
@@ -11,13 +11,16 @@ build() {
     add_module fuse
     add_module loop
     add_module dm_mod
+    add_module squashfs
+    add_module overlay
     add_runscript
 }
 
 help() {
     cat <<HELPEOF
-Adds support for booting from VHD file via kloop or vloop.
-Requires kernel params: kloop=/path/to.vhd kroot=/dev/mapper/loop0p1
-  or: vloop=/path/to.vhd vlooppart=p1
+Adds support for booting from VHD/VMDK/VDI/QCOW2/VHDX/SquashFS.
+  kloop mode: kloop=/path/to.vhd kroot=/dev/mapper/loop0p1
+  vloop mode: vloop=/path/to.vhd vlooppart=p1
+  squashfs:   squashfs=/path/to/rootfs.squashfs (boots with tmpfs overlay in RAM)
 HELPEOF
 }

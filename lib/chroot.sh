@@ -3,23 +3,24 @@
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[ -f "$LIB_DIR/../config/initramfs-defaults.conf" ] && source "$LIB_DIR/../config/initramfs-defaults.conf"
 
 # Prepare chroot environment
 prepare_chroot() {
     local mnt="$1"
     [ -d "$mnt" ] || err "Mount point does not exist: $mnt"
     
-    mount -t proc none "$mnt/proc"
-    mount -t sysfs none "$mnt/sys"
-    mount -o bind /dev "$mnt/dev"
-    mount -t devpts none "$mnt/dev/pts"
-    mount -o bind /run "$mnt/run" 2>/dev/null || mkdir -p "$mnt/run" && mount -o bind /run "$mnt/run"
+    mount -t proc none "$mnt/proc" 2>/dev/null || true
+    mount -t sysfs none "$mnt/sys" 2>/dev/null || true
+    mount -o bind /dev "$mnt/dev" 2>/dev/null || true
+    mount -t devpts none "$mnt/dev/pts" 2>/dev/null || true
+    mkdir -p "$mnt/run"
+    mount -o bind /run "$mnt/run" 2>/dev/null || true
 }
 
 # Cleanup chroot
 cleanup_chroot() {
     local mnt="$1"
+    sync
     umount "$mnt/run" 2>/dev/null || true
     umount "$mnt/dev/pts" 2>/dev/null || true
     umount "$mnt/dev" 2>/dev/null || true
@@ -27,7 +28,7 @@ cleanup_chroot() {
     umount "$mnt/proc" 2>/dev/null || true
 }
 
-# Run command in chroot (set locale to avoid perl: warning: Falling back to the standard locale ("C"))
+# Run command in chroot (set locale to avoid perl warnings)
 run_chroot() {
     local mnt="$1"
     shift
@@ -43,12 +44,38 @@ install_vhdboot() {
     case "$initramfs_method" in
         dracut)
             local hook_dir="$mnt/lib/dracut/hooks/pre-mount"
+            local module_dir="$mnt/usr/lib/dracut/modules.d/90vhdboot"
             local script=""
             [ "$boot_mode" = "kloop" ] && script="vhdmount-kloop.sh"
             [ "$boot_mode" = "vloop" ] && script="vhdmount-vloop.sh"
+
+            # Install as dracut hook
             mkdir -p "$hook_dir"
             cp "$REBUILD2_ROOT/boot/$script" "$hook_dir/10-vhdmount.sh"
             chmod +x "$hook_dir/10-vhdmount.sh"
+
+            # Also install as dracut module for better compatibility
+            mkdir -p "$module_dir"
+            cp "$REBUILD2_ROOT/boot/$script" "$module_dir/vhdmount.sh"
+            chmod +x "$module_dir/vhdmount.sh"
+            cat > "$module_dir/module-setup.sh" << 'MODEOF'
+#!/bin/bash
+check() { return 0; }
+depends() { return 0; }
+install() {
+    inst_hook pre-mount 10 "$moddir/vhdmount.sh"
+    inst_multiple blkid losetup kpartx partx 2>/dev/null || true
+    inst_multiple mount.ntfs-3g ntfs-3g 2>/dev/null || true
+    dracut_instmods squashfs overlay 2>/dev/null || true
+}
+MODEOF
+            chmod +x "$module_dir/module-setup.sh"
+
+            # Copy dracut configuration
+            if [ -f "$REBUILD2_ROOT/config/dracut-vhdboot.conf" ]; then
+                mkdir -p "$mnt/etc/dracut.conf.d"
+                cp "$REBUILD2_ROOT/config/dracut-vhdboot.conf" "$mnt/etc/dracut.conf.d/vhdboot.conf"
+            fi
             ;;
         mkinitcpio)
             mkdir -p "$mnt/usr/lib/initcpio/install" "$mnt/usr/lib/initcpio/hooks"
@@ -60,19 +87,18 @@ install_vhdboot() {
             mkdir -p "$mnt/usr/share/initramfs-tools/scripts/init-premount"
             cp "$REBUILD2_ROOT/boot/vhdmount-initramfs-tools.sh" "$mnt/usr/share/initramfs-tools/scripts/init-premount/vhdboot"
             chmod +x "$mnt/usr/share/initramfs-tools/scripts/init-premount/vhdboot"
-            # Ensure modules include required modules
             local mods="$mnt/etc/initramfs-tools/modules"
-            [ -f "$mods" ] || touch "$mods"
-            for mod in loop fuse dm_mod; do
+            [ -f "$mods" ] || { mkdir -p "$(dirname "$mods")"; touch "$mods"; }
+            for mod in loop fuse dm_mod squashfs overlay; do
                 grep -q "^${mod}$" "$mods" 2>/dev/null || echo "$mod" >> "$mods"
             done
             ;;
         *) err "Unsupported initramfs method: $initramfs_method (supported: dracut, mkinitramfs, mkinitcpio)" ;;
     esac
+    debug "Installed vhdboot ($boot_mode) via $initramfs_method"
 }
 
 # Copy vmlinuz and initramfs-vhdboot.img to output dir (same dir as VHD/VMDK/VDI)
-# For external kernel boot: GRUB loopback cannot parse VHD/VMDK/VDI format
 copy_boot_files_to_output() {
     local mnt="$1" output="$2"
     local outdir="$(dirname "$output")"
@@ -81,23 +107,24 @@ copy_boot_files_to_output() {
     local vk=""
     [ -f "$mnt/boot/vmlinuz-vhdboot" ] && vk="$mnt/boot/vmlinuz-vhdboot"
     [ -z "$vk" ] && [ -f "$mnt/boot/vmlinuz" ] && vk="$mnt/boot/vmlinuz"
-    [ -z "$vk" ] && vk=$(ls "$mnt/boot/vmlinuz-"* 2>/dev/null | head -1)
+    [ -z "$vk" ] && vk=$(ls "$mnt/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1)
     if [ -n "$vk" ] && [ -f "$vk" ]; then
         cp "$vk" "$outdir/vmlinuz"
         info "Copied vmlinuz to $outdir/"
     else
-        warn "vmlinuz not found, skipping copy"
+        warn "vmlinuz not found in $mnt/boot/, skipping copy"
     fi
     
     local initrd=""
     [ -f "$mnt/boot/initramfs-vhdboot.img" ] && initrd="$mnt/boot/initramfs-vhdboot.img"
     [ -z "$initrd" ] && [ -f "$mnt/boot/initrd-vhdboot.img" ] && initrd="$mnt/boot/initrd-vhdboot.img"
-    [ -z "$initrd" ] && initrd=$(ls "$mnt/boot/initrd.img-"* 2>/dev/null | head -1)
+    [ -z "$initrd" ] && initrd=$(ls "$mnt/boot/initrd.img-"* 2>/dev/null | sort -V | tail -1)
+    [ -z "$initrd" ] && initrd=$(ls "$mnt/boot/initramfs-"*.img 2>/dev/null | sort -V | tail -1)
     if [ -n "$initrd" ] && [ -f "$initrd" ]; then
         cp "$initrd" "$outdir/initramfs-vhdboot.img"
         info "Copied initramfs-vhdboot.img to $outdir/"
     else
-        warn "initramfs-vhdboot.img not found, skipping copy"
+        warn "initramfs-vhdboot.img not found in $mnt/boot/, skipping copy"
     fi
 }
 
@@ -107,23 +134,30 @@ build_initramfs() {
     
     install_vhdboot "$mnt" "$boot_mode" "$initramfs_method"
     
+    # Detect kernel version in chroot
+    local kver=""
+    kver=$(ls "$mnt/lib/modules" 2>/dev/null | sort -V | tail -1)
+    [ -z "$kver" ] && kver=$(run_chroot "$mnt" ls /lib/modules 2>/dev/null | sort -V | tail -1)
+    
+    info "Building initramfs ($initramfs_method, kernel: ${kver:-unknown})..."
+    
     case "$initramfs_method" in
         dracut)
-            [ -f "$mnt/usr/bin/dracut" ] || err "dracut not found, please install dracut"
-            local kver=""
-            kver=$(run_chroot "$mnt" ls /lib/modules 2>/dev/null | head -1)
+            if [ ! -f "$mnt/usr/bin/dracut" ] && [ ! -f "$mnt/usr/sbin/dracut" ]; then
+                err "dracut not found in chroot, please ensure dracut is installed"
+            fi
             run_chroot "$mnt" dracut -f --no-hostonly ${kver:+--kver "$kver"} \
                 --install "blkid losetup kpartx partx mount.fuse mount.ntfs-3g ntfs-3g shutdown lvm vgchange vgscan dmsetup" \
-                --add-drivers "fuse dm-mod loop" \
+                --add-drivers "fuse dm-mod loop squashfs overlay" \
                 -o "plymouth btrfs crypt" \
                 /boot/initramfs-vhdboot.img
             ;;
         mkinitcpio)
-            [ -f "$mnt/usr/bin/mkinitcpio" ] || err "mkinitcpio not found, please install mkinitcpio"
+            if [ ! -f "$mnt/usr/bin/mkinitcpio" ]; then
+                err "mkinitcpio not found in chroot, please ensure mkinitcpio is installed"
+            fi
             local config="$REBUILD2_ROOT/config/mkinitcpio-${boot_mode}.conf"
             [ -f "$config" ] || config=""
-            local kver=""
-            kver=$(run_chroot "$mnt" ls /lib/modules 2>/dev/null | head -1)
             if [ -n "$config" ]; then
                 cp "$config" "$mnt/etc/mkinitcpio-vhdboot.conf"
                 run_chroot "$mnt" mkinitcpio -c /etc/mkinitcpio-vhdboot.conf \
@@ -133,15 +167,23 @@ build_initramfs() {
             fi
             ;;
         mkinitramfs)
-            local kver=""
-            kver=$(run_chroot "$mnt" ls /lib/modules 2>/dev/null | head -1)
             [ -z "$kver" ] && err "Kernel modules directory /lib/modules not found"
             if [ -f "$mnt/usr/sbin/mkinitramfs" ]; then
                 run_chroot "$mnt" mkinitramfs -k "$kver" -o /boot/initramfs-vhdboot.img
+            elif [ -f "$mnt/usr/bin/mkinitramfs" ]; then
+                run_chroot "$mnt" mkinitramfs -k "$kver" -o /boot/initramfs-vhdboot.img
             else
-                err "mkinitramfs not found, please install initramfs-tools"
+                err "mkinitramfs not found in chroot, please install initramfs-tools"
             fi
             ;;
         *) err "Unsupported initramfs method: $initramfs_method" ;;
     esac
+    
+    # Verify initramfs was created
+    if [ -f "$mnt/boot/initramfs-vhdboot.img" ]; then
+        local size=$(du -h "$mnt/boot/initramfs-vhdboot.img" | cut -f1)
+        info "initramfs built successfully ($size)"
+    else
+        warn "initramfs-vhdboot.img may not have been created"
+    fi
 }

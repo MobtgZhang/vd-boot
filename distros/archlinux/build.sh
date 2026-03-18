@@ -8,7 +8,6 @@ source "$REBUILD2_ROOT/lib/disk.sh"
 source "$REBUILD2_ROOT/lib/chroot.sh"
 [ -f "$REBUILD2_ROOT/config/mirrors.conf" ] && source "$REBUILD2_ROOT/config/mirrors.conf"
 
-# Args: $1=output path $2=size(GB) $3=fixed|dynamic $4=kloop|vloop $5=format $6=initramfs method
 build() {
     local output="$1" size="${2:-16}" disk_type="${3:-dynamic}" boot_mode="${4:-kloop}" fmt="${5:-vhd}" initramfs_method="${6:-}"
     [ -z "$initramfs_method" ] && initramfs_method="$(get_initramfs_default archlinux)"
@@ -22,18 +21,21 @@ build() {
     local workdir="${WORKDIR:-/tmp/vhdboot-build}"
     local mnt="$workdir/mnt"
     local bootstrap="$workdir/archlinux-bootstrap.tar.zst"
+    local loop_dev=""
     
     mkdir -p "$workdir" "$mnt"
     
     # 1. Create disk (build with raw first, convert at end)
     local raw_disk="$workdir/arch.raw"
-    info "Creating disk ${size}GB ($disk_type)..."
-    create_disk "$raw_disk" "$size" "$disk_type" "raw"
+    info "Creating disk ${size}GB..."
+    truncate -s "${size}G" "$raw_disk"
     
     info "Partitioning and mounting..."
     loop_dev=$(partition_and_mount "$raw_disk" "$mnt")
     
-    # If system already installed in partition, skip bootstrap
+    # Register cleanup trap
+    setup_cleanup_trap "$mnt" "$loop_dev" "$workdir"
+    
     if [ -f "$mnt/etc/arch-release" ] || [ -f "$mnt/etc/os-release" ]; then
         info "Detected installed system, skipping bootstrap..."
     else
@@ -50,9 +52,8 @@ build() {
         local rootfs="$workdir/root.x86_64"
         [ -d "$rootfs" ] || rootfs="$workdir/root.$(uname -m)"
         [ -d "$rootfs" ] || rootfs=$(find "$workdir" -maxdepth 1 -type d -name "root*" | head -1)
-        [ -d "$rootfs" ] || err "root directory not found"
+        [ -d "$rootfs" ] || err "root directory not found after extracting bootstrap"
         
-        # Move root contents to mnt
         rsync -a --info=progress2 "$rootfs/" "$mnt/" 2>/dev/null || cp -a "$rootfs"/* "$mnt/"
         
         # 4. Configure mirror
@@ -62,7 +63,7 @@ build() {
     # 5. Chroot install
     prepare_chroot "$mnt"
     
-    info "Installing base and kernel..."
+    info "Installing base system and kernel..."
     case "$initramfs_method" in
         dracut)
             run_chroot "$mnt" pacman -Sy --noconfirm base base-devel linux linux-firmware \
@@ -84,39 +85,65 @@ build() {
     echo "arch-vhd" > "$mnt/etc/hostname"
     run_chroot "$mnt" ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
     echo "en_US.UTF-8 UTF-8" >> "$mnt/etc/locale.gen"
+    echo "zh_CN.UTF-8 UTF-8" >> "$mnt/etc/locale.gen"
     run_chroot "$mnt" locale-gen 2>/dev/null || true
+    echo 'LANG=en_US.UTF-8' > "$mnt/etc/locale.conf"
+    
+    # Generate fstab, set root password, configure network
+    generate_fstab "$mnt" "$loop_dev"
+    setup_root_password "$mnt"
+    setup_network "$mnt"
+    
+    # Enable essential services
+    run_chroot "$mnt" systemctl enable systemd-networkd 2>/dev/null || true
+    run_chroot "$mnt" systemctl enable systemd-resolved 2>/dev/null || true
     
     # 7. Build vhdboot initramfs
     build_initramfs "$mnt" "$boot_mode" "$initramfs_method"
     
-    # 8. Configure GRUB
+    # 8. Configure GRUB (internal boot support)
     run_chroot "$mnt" pacman -S --noconfirm grub efibootmgr 2>/dev/null || true
-    if [ -d "$mnt/boot/efi" ] || [ -d "$mnt/efi" ]; then
-        run_chroot "$mnt" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=arch 2>/dev/null || \
-        run_chroot "$mnt" grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=arch 2>/dev/null || true
-    fi
-    
-    # Use initramfs-vhdboot as default
-    run_chroot "$mnt" bash -c 'cat > /etc/default/grub.d/vhdboot.cfg << EOF
-GRUB_DEFAULT=0
-GRUB_CMDLINE_LINUX_DEFAULT="root=UUID=ROOTUUID kloop=/vhd/arch.vhd kroot=/dev/mapper/loop0p1"
-EOF' 2>/dev/null || true
     
     cleanup_chroot "$mnt"
     copy_boot_files_to_output "$mnt" "$output"
+    
+    # SquashFS: create from mounted rootfs before unmount
+    if [ "$fmt" = "squashfs" ]; then
+        check_squashfs_deps
+        mkdir -p "$(dirname "$output")"
+        create_squashfs "$mnt" "$output"
+    fi
+    
     unmount_disk "$mnt" "$loop_dev"
     
-    # 9. Convert format
-    mkdir -p "$(dirname "$output")"
-    case "$fmt" in
-        vhd) qemu-img convert -f raw -O vpc -o subformat=${disk_type} "$raw_disk" "$output" ;;
-        vmdk) qemu-img convert -f raw -O vmdk "$raw_disk" "$output" ;;
-        vdi) qemu-img convert -f raw -O vdi "$raw_disk" "$output" ;;
-        *) cp "$raw_disk" "$output" ;;
-    esac
+    # Convert format (skip for squashfs, already created above)
+    if [ "$fmt" != "squashfs" ]; then
+        mkdir -p "$(dirname "$output")"
+        case "$fmt" in
+            vhd)
+                local subformat="dynamic"
+                [ "$disk_type" = "fixed" ] && subformat="fixed"
+                qemu-img convert -f raw -O vpc -o subformat=${subformat} "$raw_disk" "$output"
+                ;;
+            vmdk)  qemu-img convert -f raw -O vmdk "$raw_disk" "$output" ;;
+            vdi)   qemu-img convert -f raw -O vdi "$raw_disk" "$output" ;;
+            qcow2)
+                local prealloc="off"
+                [ "$disk_type" = "fixed" ] && prealloc="full"
+                qemu-img convert -f raw -O qcow2 -o preallocation=${prealloc} "$raw_disk" "$output"
+                ;;
+            vhdx)
+                local subformat="dynamic"
+                [ "$disk_type" = "fixed" ] && subformat="fixed"
+                qemu-img convert -f raw -O vhdx -o subformat=${subformat} "$raw_disk" "$output"
+                ;;
+            *)     cp "$raw_disk" "$output" ;;
+        esac
+    fi
     
+    clear_cleanup_trap
     rm -rf "$workdir"
-    info "Done: $output"
+    info "Build complete: $output"
 }
 
 build "$@"

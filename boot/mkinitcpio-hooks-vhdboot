@@ -1,10 +1,10 @@
 #!/usr/bin/ash
-# mkinitcpio runtime hook - vhdboot (kloop/vloop)
+# mkinitcpio runtime hook - vhdboot (kloop/vloop/squashfs)
 # Copy to chroot /usr/lib/initcpio/hooks/vhdboot
 # Uses ash syntax
 
 run_hook() {
-    local x vloop kloop kroot vlooppart hostfstype hostdev disk_files
+    local x vloop kloop kroot vlooppart hostfstype hostdev squashfs
 
     for x in $(cat /proc/cmdline); do
         case $x in
@@ -13,8 +13,34 @@ run_hook() {
             vloop=*) vloop="${x#vloop=}" ;;
             vlooppart=*) vlooppart="${x#vlooppart=}" ;;
             hostfstype=*) hostfstype="${x#hostfstype=}" ;;
+            squashfs=*) squashfs="${x#squashfs=}" ;;
         esac
     done
+
+    # SquashFS boot: mount squashfs read-only, overlay with tmpfs
+    if [ -n "$squashfs" ]; then
+        export SQUASHFS_USED=1
+        hostdev="${root#block:}"
+        mkdir -p /host
+        [ -z "$hostfstype" ] && hostfstype="$(blkid -s TYPE -o value "$hostdev" 2>/dev/null)"
+        [ -z "$hostfstype" ] || [ "$hostfstype" = "ntfs" ] && hostfstype="ntfs-3g"
+        [ "$hostfstype" = "ntfs-3g" ] || modprobe "$hostfstype" 2>/dev/null
+        mount -t "$hostfstype" -o ro "$hostdev" /host
+
+        modprobe squashfs 2>/dev/null
+        modprobe overlay 2>/dev/null
+
+        mkdir -p /run/vdboot/squashfs /run/vdboot/tmpfs
+
+        mount -t squashfs -o ro "/host${squashfs}" /run/vdboot/squashfs
+        mount -t tmpfs -o size=50% tmpfs /run/vdboot/tmpfs
+        mkdir -p /run/vdboot/tmpfs/upper /run/vdboot/tmpfs/work
+
+        mount -t overlay overlay \
+            -o lowerdir=/run/vdboot/squashfs,upperdir=/run/vdboot/tmpfs/upper,workdir=/run/vdboot/tmpfs/work \
+            /new_root
+        return
+    fi
 
     if [ -n "$kloop" ]; then
         export KLOOP_USED=1
@@ -52,6 +78,10 @@ run_hook() {
 }
 
 run_latehook() {
+    if [ -n "$SQUASHFS_USED" ]; then
+        [ -d /new_root/host ] || mkdir -p /new_root/host
+        mount -R /host /new_root/host 2>/dev/null || true
+    fi
     if [ -n "$VLOOP_USED" ] || [ -n "$KLOOP_USED" ]; then
         [ -d /new_root/host ] || mkdir -p /new_root/host
         mount -M /host /new_root/host 2>/dev/null || true

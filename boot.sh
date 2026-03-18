@@ -1,18 +1,18 @@
 #!/bin/bash
 #
 # vd-boot - GRUB boot entry script
-# Adds VHD boot configuration to system GRUB
+# Adds VHD/VMDK/VDI/QCOW2/VHDX/SquashFS boot configuration to system GRUB
 #
 # Usage:
 #   1. Install mode: sudo ./boot.sh install [options]
-#      Add VHD boot entry to system GRUB and update config
+#      Add boot entry to system GRUB and update config
 #
 #   2. Generate mode: ./boot.sh generate [options]
 #      Generate GRUB config fragment only, output to stdout
 #
 # Options:
-#   -v, --vhd PATH      VHD file path (e.g. /vhd/arch.vhd)
-#   -b, --boot MODE     Boot mode: kloop | vloop (default: kloop)
+#   -v, --vhd PATH      Disk image path (e.g. /vhd/arch.vhd, /vhd/arch.qcow2, /vhd/rootfs.squashfs)
+#   -b, --boot MODE     Boot mode: kloop | vloop | squashfs (default: kloop, auto for .squashfs files)
 #   -n, --name NAME     Menu display name (default: VHD Linux)
 #   -p, --part PART     vloop partition: p1|p2|p3... (vloop mode, default: p1)
 #   -k, --kernel PATH   Kernel path (default: same dir as VHD, or /boot/vmlinuz with --inside)
@@ -22,8 +22,9 @@
 #   -t, --target PATH   Target device for GRUB install (e.g. /dev/sdb)
 #
 # Notes:
-#   Default: kernel/initrd in same directory as VHD (must be on host partition)
+#   Default: kernel/initrd in same directory as disk image (must be on host partition)
 #   --inside: Load from inside VHD, kernel in VHD /boot (fixed VHD only, GRUB loopback does not support dynamic format)
+#   SquashFS: Always uses external kernel, boots into RAM with tmpfs overlay
 #
 
 set -e
@@ -58,12 +59,13 @@ vd-boot - GRUB boot entry script
 Usage: $0 <command> [options]
 
 Commands:
-  install [options]  Add VHD boot entry to system GRUB and run update-grub
+  install [options]  Add boot entry to system GRUB and run update-grub
   generate [options] Generate GRUB config fragment only (output to stdout)
 
 Options:
-  -v, --vhd PATH     VHD file path (default: /vhd/arch-kloop-dynamic.vhd)
-  -b, --boot MODE    Boot mode: kloop | vloop (default: kloop)
+  -v, --vhd PATH     Disk image path (default: /vhd/arch-kloop-dynamic.vhd)
+                      Supports: .vhd .vmdk .vdi .qcow2 .vhdx .squashfs
+  -b, --boot MODE    Boot mode: kloop | vloop | squashfs (default: kloop, auto for .squashfs files)
   -n, --name NAME    Menu display name (default: VHD Linux)
   -p, --part PART    vloop partition: p1|p2|p3... (default: p1)
   -k, --kernel PATH  Kernel path (default: same dir as VHD, or /boot/vmlinuz with --inside)
@@ -73,9 +75,10 @@ Options:
   -t, --target PATH  Target device for GRUB install (e.g. /dev/sdb or /dev/sdb1, use with -g)
 
 Notes:
-  Default: kernel/initrd in same directory as VHD (must be on host partition)
+  Default: kernel/initrd in same directory as disk image (must be on host partition)
   --inside: Load from inside VHD, kernel in VHD /boot
-  Note: Dynamic VHD/VMDK/VDI cannot load from inside due to GRUB loopback limit, must use external kernel
+  Dynamic VHD/VMDK/VDI cannot load from inside due to GRUB loopback limit, must use external kernel
+  SquashFS: Always uses external kernel, boots into RAM with tmpfs overlay
 
 Examples:
   # Load from inside VHD (fixed VHD, kernel in VHD /boot/vmlinuz)
@@ -84,8 +87,14 @@ Examples:
   # External kernel (same dir as VHD)
   sudo $0 install -v /vhd/arch.vhd -n "Arch Linux VHD"
 
-  # Dynamic VHD must use external kernel (cannot use --inside)
-  sudo $0 install -v /vhd/arch-dynamic.vhd -n "Arch Linux VHD"
+  # QCOW2 disk image
+  sudo $0 install -v /vhd/arch.qcow2 -n "Arch Linux QCOW2"
+
+  # VHDX disk image
+  sudo $0 install -v /vhd/arch.vhdx -n "Arch Linux VHDX"
+
+  # SquashFS image (boots in RAM with overlay)
+  sudo $0 install -v /vhd/rootfs.squashfs -n "Arch Linux SquashFS"
 
   # Generate config only
   $0 generate -v /vhd/fedora.vhd -b kloop
@@ -114,9 +123,28 @@ parse_args() {
     done
 }
 
+# Auto-detect squashfs boot mode from file extension
+auto_detect_boot_mode() {
+    case "$VHDFILE" in
+        *.squashfs)
+            if [ "$BOOT_MODE" = "kloop" ] || [ "$BOOT_MODE" = "vloop" ]; then
+                BOOT_MODE="squashfs"
+                info "Auto-detected SquashFS boot mode from file extension"
+            fi
+            ;;
+    esac
+}
+
 # Set default kernel/initrd path based on VHD dir or --inside (when user did not specify -k/-i)
 set_default_kernel_initrd() {
-    if [ "$KERNEL_FROM_INSIDE" = "1" ]; then
+    auto_detect_boot_mode
+
+    if [ "$BOOT_MODE" = "squashfs" ]; then
+        local vhd_dir
+        vhd_dir="$(dirname "$VHDFILE")"
+        [ -z "$KERNEL_PATH" ] && KERNEL_PATH="$vhd_dir/vmlinuz" || true
+        [ -z "$INITRD_PATH" ] && INITRD_PATH="$vhd_dir/initramfs-vhdboot.img" || true
+    elif [ "$KERNEL_FROM_INSIDE" = "1" ]; then
         [ -z "$KERNEL_PATH" ] && KERNEL_PATH="/boot/vmlinuz" || true
         [ -z "$INITRD_PATH" ] && INITRD_PATH="/boot/initramfs-vhdboot.img" || true
     else
@@ -130,13 +158,12 @@ set_default_kernel_initrd() {
 generate_grub_config() {
     local kroot_part="$VLOOP_PART"
     [ -z "$kroot_part" ] && kroot_part="p1" || true
-    # loopback partition: p1->1, p2->2
     local lp_part="${kroot_part#p}"
     [ -z "$lp_part" ] && lp_part="1" || true
 
     cat << GRUBEOF
 # vd-boot entry - generated by boot.sh
-# VHD: $VHDFILE | Mode: $BOOT_MODE | Kernel: $([ "$KERNEL_FROM_INSIDE" = "1" ] && echo "Inside VHD" || echo "External")
+# Image: $VHDFILE | Mode: $BOOT_MODE | Kernel: $([ "$BOOT_MODE" = "squashfs" ] && echo "External (SquashFS)" || ([ "$KERNEL_FROM_INSIDE" = "1" ] && echo "Inside VHD" || echo "External"))
 
 menuentry '$MENU_NAME' --class gnu-linux --class os {
     set vhdfile="$VHDFILE"
@@ -145,8 +172,10 @@ menuentry '$MENU_NAME' --class gnu-linux --class os {
 
 GRUBEOF
 
-    if [ "$KERNEL_FROM_INSIDE" = "1" ]; then
-        # Load from inside VHD (fixed VHD only, GRUB loopback does not support dynamic format)
+    if [ "$BOOT_MODE" = "squashfs" ]; then
+        echo "    linux $KERNEL_PATH root=UUID=\${uuid} squashfs=\$vhdfile"
+        echo "    initrd $INITRD_PATH"
+    elif [ "$KERNEL_FROM_INSIDE" = "1" ]; then
         echo "    insmod part_gpt"
         echo "    insmod part_msdos"
         echo "    insmod ext2"

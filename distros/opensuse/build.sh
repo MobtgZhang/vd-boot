@@ -16,25 +16,26 @@ build() {
     check_root
     check_deps
     
-    command -v zypper >/dev/null || err "OpenSUSE build requires zypper, run on OpenSUSE host or use: docker run --privileged -v \$(pwd):/out opensuse/leap /out/vd-boot/distros/opensuse/build.sh ..."
+    command -v zypper >/dev/null || err "OpenSUSE build requires zypper, run on OpenSUSE host or use:\n  docker run --privileged -v \$(pwd):/out opensuse/leap /out/vd-boot/distros/opensuse/build.sh ..."
     
     local workdir="${WORKDIR:-/tmp/vhdboot-build}"
     local mnt="$workdir/mnt"
+    local loop_dev=""
     
     mkdir -p "$workdir" "$mnt"
     
     local raw_disk="$workdir/opensuse.raw"
-    info "Creating disk ${size}GB ($disk_type)..."
-    create_disk "$raw_disk" "$size" "$disk_type" "raw"
+    info "Creating disk ${size}GB..."
+    truncate -s "${size}G" "$raw_disk"
     
     info "Partitioning and mounting..."
     loop_dev=$(partition_and_mount "$raw_disk" "$mnt")
     
-    # If system already installed in partition, skip zypper install
+    setup_cleanup_trap "$mnt" "$loop_dev" "$workdir"
+    
     if [ -f "$mnt/etc/os-release" ]; then
         info "Detected installed system, skipping zypper install..."
     else
-        # Configure zypper repos
         mkdir -p "$mnt/etc/zypp/repos.d"
         cat > "$mnt/etc/zypp/repos.d/oss.repo" << EOF
 [oss]
@@ -51,13 +52,11 @@ enabled=1
 gpgcheck=0
 EOF
         
-        # zypper --root install
         info "zypper install (Leap ${OPENSUSE_LEAP})..."
         zypper --root="$mnt" --non-interactive refresh 2>/dev/null || true
         zypper --root="$mnt" --non-interactive install -y -t pattern minimal_base 2>/dev/null || \
         zypper --root="$mnt" --non-interactive install -y aaa_base kernel-default dracut kpartx ntfs-3g util-linux lvm2
         
-        # If pattern install fails, try direct package install
         if [ ! -f "$mnt/usr/bin/bash" ]; then
             zypper --root="$mnt" --non-interactive install -y aaa_base filesystem bash coreutils kernel-default dracut kpartx ntfs-3g util-linux lvm2
         fi
@@ -68,22 +67,56 @@ EOF
     
     prepare_chroot "$mnt"
     
+    # Generate fstab, set root password, configure network
+    generate_fstab "$mnt" "$loop_dev"
+    setup_root_password "$mnt"
+    setup_network "$mnt"
+    
+    # Enable essential services
+    run_chroot "$mnt" systemctl enable systemd-networkd 2>/dev/null || true
+    run_chroot "$mnt" systemctl enable systemd-resolved 2>/dev/null || true
+    run_chroot "$mnt" systemctl enable wicked 2>/dev/null || true
+    
     build_initramfs "$mnt" "$boot_mode" "$initramfs_method"
     
     cleanup_chroot "$mnt"
     copy_boot_files_to_output "$mnt" "$output"
+    
+    if [ "$fmt" = "squashfs" ]; then
+        check_squashfs_deps
+        mkdir -p "$(dirname "$output")"
+        create_squashfs "$mnt" "$output"
+    fi
+    
     unmount_disk "$mnt" "$loop_dev"
     
-    mkdir -p "$(dirname "$output")"
-    case "$fmt" in
-        vhd) qemu-img convert -f raw -O vpc -o subformat=${disk_type} "$raw_disk" "$output" ;;
-        vmdk) qemu-img convert -f raw -O vmdk "$raw_disk" "$output" ;;
-        vdi) qemu-img convert -f raw -O vdi "$raw_disk" "$output" ;;
-        *) cp "$raw_disk" "$output" ;;
-    esac
+    if [ "$fmt" != "squashfs" ]; then
+        mkdir -p "$(dirname "$output")"
+        case "$fmt" in
+            vhd)
+                local subformat="dynamic"
+                [ "$disk_type" = "fixed" ] && subformat="fixed"
+                qemu-img convert -f raw -O vpc -o subformat=${subformat} "$raw_disk" "$output"
+                ;;
+            vmdk)  qemu-img convert -f raw -O vmdk "$raw_disk" "$output" ;;
+            vdi)   qemu-img convert -f raw -O vdi "$raw_disk" "$output" ;;
+            qcow2)
+                local prealloc="off"
+                [ "$disk_type" = "fixed" ] && prealloc="full"
+                qemu-img convert -f raw -O qcow2 -o preallocation=${prealloc} "$raw_disk" "$output"
+                ;;
+            vhdx)
+                local subformat="dynamic"
+                [ "$disk_type" = "fixed" ] && subformat="fixed"
+                qemu-img convert -f raw -O vhdx -o subformat=${subformat} "$raw_disk" "$output"
+                ;;
+            *)     cp "$raw_disk" "$output" ;;
+        esac
+    fi
     
+    clear_cleanup_trap
     rm -rf "$workdir"
-    info "Done: $output"
+    info "Build complete: $output"
 }
 
 build "$@"
